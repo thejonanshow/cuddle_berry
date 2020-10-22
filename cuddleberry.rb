@@ -147,7 +147,13 @@ print "> "
 @share_nfs = gets.chomp.downcase
 @share_nfs = "n" if @share_nfs.empty?
 
-default_ip = `ping raspberrypi.local -c 1 | head -n 1`.split("(").last.split(")").first
+ping = ""
+while ping.empty?
+  puts "searching for raspberrypi.local..."
+  ping = `ping raspberrypi.local -c 1 | head -n 1`
+end
+
+default_ip = ping.split("(").last.split(")").first
 puts default_ip
 puts
 puts "Enter target ip (#{default_ip}):"
