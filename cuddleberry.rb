@@ -82,34 +82,6 @@ def cmds_for(task, runner:)
   end
 end
 
-def completed?(task, runner:)
-  case task
-  when :update
-    false
-  when :dhcp
-    dhcpcd = runner.call("cat /etc/dhcpcd.conf")
-    dhcpcd.include? @ip
-  when :nfs_fstab
-    return true unless @share_nfs == "y"
-    configured_host = runner.call("cat /etc/hostname").strip
-    runner.call("cat /etc/fstab").include? configured_host
-  when :nfs_exports
-    return true unless @share_nfs == "y"
-    configured_host = runner.call("cat /etc/hostname").strip
-    runner.call("cat /etc/exports").include? configured_host
-  when :ssh
-    false
-  when :password
-    false
-  when :hosts
-    !runner.call("cat /etc/hosts").include? "raspberrypi"
-  when :hostname
-    !runner.call("cat /etc/hostname").include? "raspberrypi"
-  else
-    raise NotImplementedError.new("Unknown task: #{task}")
-  end
-end
-
 def generate_hostname
   filenames = Dir.glob("cuddleberry.#{@hostname_prefix}*")
   existing_hosts = filenames.map { |filename| filename.split(".").map { |parts| parts[1] } }
