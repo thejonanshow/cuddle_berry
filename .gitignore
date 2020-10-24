@@ -1,1 +1,3 @@
-cuddleberry_authorized_keys
+.cuddleberry_authorized_keys
+.cuddle_berry_nodes
+kubeconfig

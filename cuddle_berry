@@ -1,0 +1,399 @@
+#!/usr/bin/env ruby
+
+HOSTNAME_PREFIX = "drone" # nodes will be named sequentially: drone0, drone1, drone2...
+PASSWORD_SUFFIX = "cuddle" # passwords will be set to node name + suffix, e.g. 'drone0cuddle'
+
+PROMPT_FOR_NFS = false # set this to true if you want to mount an attached USB drive to a node
+SKIP_PACKAGE_UPDATE = true
+
+MAXIMUM_NODES = 2
+NODE_FILE = ".cuddle_berry_nodes"
+
+CGROUP_FEATURES = [
+  "cgroup_enable=cpuset",
+  "cgroup_memory=1",
+  "cgroup_enable=memory"
+]
+
+require "net/ssh"
+require "net/http"
+require "net/scp"
+require "nokogiri"
+
+def setup_authorized_keys_file
+  if File.exists? ".cuddleberry_authorized_keys"
+    puts "Using existing keys from .cuddleberry_authorized_keys."
+    return false
+  end
+
+  puts
+  puts "Creating '.cuddleberry_authorized_keys' file."
+  puts "Enter your GitHub username to pull public keys:"
+  print "> "
+  user = gets.chomp
+  response = Net::HTTP.get_response(URI("https://github.com/#{user}.keys"))
+
+  if response.is_a?(Net::HTTPSuccess)
+    keys = response.body
+  else
+    raise ArgumentError.new("Unexpected response: #{response.class}")
+  end
+
+  if keys.strip.empty?
+    raise ArgumentError.new("No keys found for #{user}.")
+  end
+
+  File.write(".cuddleberry_authorized_keys", keys)
+end
+
+def disk_list
+  xml = `diskutil list -plist external physical`
+  Nokogiri::XML(xml)
+end
+
+def disks_with_boot_volume
+  doc = disk_list
+
+  doc.css("dict array dict").select do |dict|
+    dict.css("string").map(&:text).include? "boot"
+  end
+end
+
+def get_disk_name
+  disks = disks_with_boot_volume
+
+  if !disks.empty?
+    disk_names = disks.first.children.select do |child|
+      child.text.match /disk/
+    end
+
+    disk_names.first.text
+  else
+    ""
+  end
+end
+
+def mount_disk(disk_name)
+  if File.exists? "/Volumes/boot"
+    puts "Skipping disk mount, disk is already mounted."
+    return false
+  end
+
+  tries = 0
+  while tries <= 3
+    result = `diskutil mountDisk #{disk_name}`
+    break unless result.include? "failed"
+    puts result
+    sleep 1
+    tries += 1
+  end
+
+  puts "Failed to mount #{disk_name} after 3 attempts." if tries > 3
+end
+
+def unmount_disk(disk_name)
+  unless File.exists? "/Volumes/boot"
+    puts "Skipping disk unmount, disk is not mounted."
+    return false
+  end
+
+  tries = 0
+  while tries <= 3
+    result = `diskutil unmountDisk #{disk_name}`
+    break unless result.include? "failed"
+    puts result
+    sleep 1
+    tries += 1
+  end
+
+  puts "Failed to unmount #{disk_name} after 3 attempts." if tries > 3
+end
+
+def setup_ssh
+  if File.exists?("/Volumes/boot") && File.exists?("/Volumes/boot/ssh")
+    puts "SSH is already enabled, skipping SSH setup."
+    return false
+  end
+
+  disk_name = get_disk_name
+
+  if disk_name.empty?
+    puts "No disk attached, skipping SSH setup."
+    return false
+  end
+
+  puts "Creating /boot/ssh to enable SSH on #{disk_name}"
+
+  mount_disk(disk_name)
+  `touch /Volumes/boot/ssh`
+  unmount_disk(disk_name)
+end
+
+def prompt_to_eject
+  puts
+  puts "SD card setup complete. Follow these steps:"
+  puts "1. Eject disk"
+  puts "2. Insert disk into Raspberry Pi"
+  puts "3. Power up Raspberry Pi"
+  puts "(then hit Enter to continue)"
+  gets
+end
+
+def setup_cgroups
+  disk = get_disk_name
+
+  if cgroups_setup?
+    puts "Control group settings are already defined in cmdline.txt, skipping cgroups setup."
+    return false
+  end
+
+  if disk.empty?
+    puts "No disk found, skipping control group setup."
+    return false
+  end
+
+  mount_disk(disk)
+  cmdline = File.read("/Volumes/boot/cmdline.txt").strip
+  puts "Updating cmdline.txt with cgroup features."
+  puts "Existing: #{cmdline}"
+
+  CGROUP_FEATURES.each do |feature|
+    cmdline << " #{feature}" unless cmdline.include? feature
+  end
+
+  puts "Updated: #{cmdline}"
+  File.write("/Volumes/boot/cmdline.txt", cmdline)
+ensure
+  unmount_disk(disk)
+end
+
+def cgroups_setup?
+  disk = get_disk_name
+  return false if disk.empty?
+
+  mount_disk(disk)
+  cmdline = File.read("/Volumes/boot/cmdline.txt")
+
+  CGROUP_FEATURES.all? do |feature|
+    cmdline.include? feature
+  end
+ensure
+  unmount_disk(disk)
+end
+
+def cmds_for(task, runner:)
+  case task
+  when :update
+    puts "(updating is the slowest part, this might take as long as 3 minutes.)"
+    runner.call("apt-get update && apt-get upgrade -y")
+  when :dhcp
+    router = ip_address.gsub(/\.\d+$/, ".1")
+    dhcp = [
+      "interface eth0",
+      "static ip_address=#{ip_address}/24",
+      "static routers=#{router}",
+      "static domain_name_servers=1.1.1.1"
+    ].join("\n")
+    runner.call('echo "' + dhcp + '" >> /etc/dhcpcd.conf')
+  when :nfs_fstab
+    path = "/var/#{get_hostname}-data"
+    runner.call("apt-get install -y nfs-kernel-server")
+    runner.call("mkdir -p #{path}")
+    runner.call('echo "/dev/sda1 '+ path + ' ext4 defaults,noatime 0 2" >> /etc/fstab')
+  when :nfs_exports
+    mask = ip_address.gsub(/\.\d+$/, ".1/24")
+    path = "/var/#{get_hostname}-data"
+
+    runner.call("apt-get install -y nfs-kernel-server")
+    runner.call("mkdir -p #{path}")
+    cmd = 'echo "'
+    cmd << path + " "
+    cmd << mask
+    cmd << '(rw,sync,no_root_squash,no_subtree_check)" >> /etc/exports'
+    runner.call(cmd)
+  when :ssh
+    cmd = "mkdir -p /home/pi/.ssh; "
+    cmd << "cp /tmp/authorized_keys /home/pi/.ssh/authorized_keys; "
+    cmd << "chown pi:pi -R /home/pi/.ssh; "
+    cmd << "chmod 700 /home/pi/.ssh; "
+    cmd << "chmod 600 /home/pi/.ssh/authorized_keys; "
+    runner.call(cmd)
+  when :password
+    pwd = get_hostname + PASSWORD_SUFFIX
+    crypt_cmd = "python3 -c 'import crypt; print(crypt.crypt(" + pwd + ", crypt.mksalt(crypt.METHOD_SHA512)))'"
+    @hashed_password = runner.call(crypt_cmd)
+    runner.call("printf $'pi:#{@hashed_password}' | sudo chpasswd --encrypted")
+  when :hosts
+    existing_hosts = runner.call('cat /etc/hosts')
+    new_hosts = existing_hosts.gsub("raspberrypi", get_hostname)
+    runner.call('echo "' + new_hosts + '" > /etc/hosts')
+  when :hostname
+    existing_hostname = runner.call('cat /etc/hostname')
+    new_hostname = existing_hostname.gsub("raspberrypi", get_hostname)
+    runner.call('echo "' + new_hostname + '" > /etc/hostname')
+  when :reboot
+    runner.call('reboot now') rescue IOError
+  when :wait_for_reboot
+    puts
+    puts "Waiting for your #{get_hostname} to reboot..."
+    puts
+    wait_for_ping(get_hostname)
+  else
+    raise NotImplementedError.new("Unknown task: #{task}")
+  end
+end
+
+def completed?(task, runner:)
+  case task
+  when :update
+    SKIP_PACKAGE_UPDATE
+  when :dhcp
+    dhcpcd = runner.call("cat /etc/dhcpcd.conf")
+    dhcpcd.include? ip_address
+  when :nfs_fstab
+    return true unless share_nfs?
+    configured_host = runner.call("cat /etc/hostname").strip
+    runner.call("cat /etc/fstab").include? configured_host
+  when :nfs_exports
+    return true unless share_nfs?
+    configured_host = runner.call("cat /etc/hostname").strip
+    runner.call("cat /etc/exports").include? configured_host
+  when :ssh
+    false
+  when :password
+    false
+  when :hosts
+    !runner.call("cat /etc/hosts").include? "raspberrypi"
+  when :hostname
+    !runner.call("cat /etc/hostname").include? "raspberrypi"
+  when :reboot
+    false
+  when :wait_for_reboot
+    false
+  else
+    raise NotImplementedError.new("Unknown task: #{task}")
+  end
+end
+
+def nodes
+  return [] unless File.exists? NODE_FILE
+  File.read(NODE_FILE).split("\n").uniq
+end
+
+def generate_hostname
+  host = "#{HOSTNAME_PREFIX}#{nodes.length}"
+  add_node
+  host
+end
+
+def add_node
+  if nodes.length <= MAXIMUM_NODES - 1
+    new_nodes_for_file = nodes << ip_address
+  else
+    new_nodes_for_file = [ip_address]
+  end
+
+  File.write(NODE_FILE, new_nodes_for_file.join("\n"))
+end
+
+def setup_node
+  sleep 15
+
+  if nodes.length > 1
+    puts `k3sup join --ip #{ip_address} --server-ip #{nodes.first} --user pi`
+  else
+    puts `k3sup install --ip #{ip_address} --user pi`
+  end
+
+  puts `export KUBECONFIG=/Users/jonan/src/cuddle_berry/kubeconfig; kubectl get nodes`
+end
+
+def wait_for_ping(host)
+  ping = ""
+
+  puts "Waiting for Raspberry Pi to boot (typically less than 1 minute)"
+
+  while ping.empty?
+    puts "searching for #{host}.local..."
+    ping = `ping #{host}.local -c 1 | head -n 1 2> /dev/null`
+  end
+
+  sleep 5 # give ssh time to start before we decide it's online
+
+  puts "#{host}.local is online!"
+
+  ping
+end
+
+def ip_address
+  return @ip unless @ip.nil?
+  ping = wait_for_ping("raspberrypi")
+  @ip = ping.split("(").last.split(")").first
+end
+
+def get_hostname
+  return @hostname unless @hostname.nil?
+  @hostname = generate_hostname
+end
+
+def share_nfs?
+  return false unless PROMPT_FOR_NFS
+  return @share_nfs unless @share_nfs.nil?
+
+  puts "Share NFS? (nY):"
+  print "> "
+  @share_nfs = gets.chomp.downcase == "y"
+  @share_nfs
+end
+
+def prepare_sd_card
+  setup_authorized_keys_file
+  setup_ssh
+  setup_cgroups
+
+  prompt_to_eject unless get_disk_name.empty?
+end
+
+def setup
+  prepare_sd_card
+
+  local = "#{Dir.pwd}/.cuddleberry_authorized_keys"
+  remote = "/tmp/authorized_keys"
+  begin
+    result = Net::SCP.upload!(ip_address, "pi", local, remote, :ssh => { :password => "raspberry" })
+  rescue Net::SSH::HostKeyMismatch
+    `rm ~/.ssh/known_hosts`
+    retry
+  end
+
+  # These are ordered, be careful
+  tasks = %i(update dhcp nfs_fstab nfs_exports ssh password hosts hostname reboot wait_for_reboot)
+
+  Net::SSH.start(ip_address, "pi", password: "raspberry") do |ssh|
+    runner = -> (cmd) do
+      result = ssh.exec!("sudo bash -c '#{cmd}'")
+      lines = result.split("\n")
+      lines = lines.reject { |line| line.split.first == "bash:" || line.split.first == "sudo:" }
+      result = lines.join("\n")
+      result
+    end
+
+    tasks.each do |task|
+      if completed?(task, runner: runner)
+        puts "Skipping #{task}."
+      else
+        puts "Running #{task}."
+        cmds_for(task, runner: runner)
+      end
+    end
+  end
+end
+
+puts
+puts "*" + "-"*26 + "*"
+puts "| Let's cuddle some Pis! π |"
+puts "*" + "-"*26 + "*"
+puts
+
+setup
+setup_node
